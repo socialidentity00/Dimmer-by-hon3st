@@ -43,7 +43,7 @@ DEFAULT_LEVEL = 35          # dimming % every time Dimmer starts
 DEFAULTS_VERSION = 4        # bump to re-apply the defaults above one time
 
 # ---- updates (see the GitHub steps) -------------------------------------
-VERSION = "1.0.5"                       # raise this number before building each new release
+VERSION = "1.0.7"                       # raise this number before building each new release
 GITHUB_REPO = "socialidentity00/Dimmer-by-hon3st"   # your GitHub  username/repository
 UPDATE_ASSET = "Dimmer.exe"             # the file you attach to each GitHub release
 
@@ -129,9 +129,13 @@ user32.SetWindowPos.restype = wintypes.BOOL
 HWND_TOPMOST = wintypes.HWND(-1)
 
 
-def lift_taskbars():
-    """put the Windows taskbar(s) above the dim layer, so an auto-hide taskbar that
-    slides in is already bright (otherwise it stays dim until you click it)"""
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+_SWP_QUIET = 0x0001 | 0x0002 | 0x0010      # no resize, no move, no activate
+
+
+def find_taskbars():
+    """window handles of the main taskbar and any taskbars on other monitors"""
     hwnds = []
     main = user32.FindWindowW("Shell_TrayWnd", None)
     if main:
@@ -142,8 +146,19 @@ def lift_taskbars():
         if not h:
             break
         hwnds.append(h)
-    for hw in hwnds:
-        user32.SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+    return hwnds
+
+
+def lift_taskbars():
+    """taskbar(s) go above the dim layer (used when 'Dim taskbar too' is unticked, so an
+    auto-hide taskbar that slides in is already bright)"""
+    for hw in find_taskbars():
+        user32.SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, _SWP_QUIET)
+
+
+def put_taskbar_under(taskbar, overlay_hwnd):
+    """taskbar goes just below the dim layer (used when 'Dim taskbar too' is ticked)"""
+    user32.SetWindowPos(taskbar, overlay_hwnd, 0, 0, 0, 0, _SWP_QUIET)
 
 
 def fullscreen_busy():
@@ -168,6 +183,19 @@ def overlay_rect(mon, dim_taskbar, autohide, edge):
         else:
             b -= EDGE_STRIP
     return l, t, r, b
+
+
+def strip_rect(mon, edge):
+    """the thin strip along the taskbar edge. The big dim layer leaves it free (so an auto-hide
+    taskbar can still pop up); a second, tiny dim layer covers it so no bright line shows."""
+    l, t, r, b = mon["mon"]
+    if edge == 0:
+        return l, t, l + EDGE_STRIP, b
+    if edge == 1:
+        return l, t, r, t + EDGE_STRIP
+    if edge == 2:
+        return r - EDGE_STRIP, t, r, b
+    return l, b - EDGE_STRIP, r, b
 
 
 # ------------------------------------------------------------------- icons
@@ -546,12 +574,16 @@ class Overlay:
         self.win.attributes("-alpha", 0.0)
         self.win.update_idletasks()
         hwnd = user32.GetAncestor(self.win.winfo_id(), 2)
+        self.hwnd = hwnd
         ex = user32.GetWindowLongW(hwnd, -20)
         # layered | click-through | toolwindow (no taskbar) | no-activate
         user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80 | 0x08000000)
         self.win.withdraw()
         self.geom = None
         self.alpha = None
+
+    def shown(self):
+        return self.win.state() != "withdrawn"
 
     def update(self, rect, alpha, visible):
         """returns True if something visible changed"""
@@ -745,6 +777,7 @@ class DimmerApp:
         self.mon_key = None
         self.monitors = []
         self.overlays = []
+        self.strips = []
         self.scr_on = []
         self.scr_level = []
         self.tray = None
@@ -883,14 +916,16 @@ class DimmerApp:
             return
         self.mon_key = key
         self.monitors = mons
-        for o in self.overlays:
+        for o in self.overlays + self.strips:
             o.destroy()
         self.overlays = [Overlay(self.root) for _ in mons]
+        self.strips = [Overlay(self.root) for _ in mons]
         self.build_screens()
         self.apply()
 
     def apply(self):
-        if len(self.overlays) != len(self.monitors) or len(self.scr_on) != len(self.monitors):
+        if (len(self.overlays) != len(self.monitors) or len(self.strips) != len(self.monitors)
+                or len(self.scr_on) != len(self.monitors)):
             return
         autohide, edge = taskbar_info()
         changed = False
@@ -900,8 +935,15 @@ class DimmerApp:
             rect = overlay_rect(mon, self.dim_taskbar.get(), autohide, edge)
             if self.overlays[i].update(rect, alpha, on):
                 changed = True
+            # thin strip at the auto-hide taskbar edge, dimmed too so no bright line is left
+            if self.strips[i].update(strip_rect(mon, edge), alpha, on and autohide):
+                changed = True
         if changed:
             self.lift_ui()
+        try:
+            self.guard_taskbars()
+        except Exception:
+            pass
 
     def lift_ui(self):
         """ticked: Dimmer window sits above the dim layer. unticked: dim layer covers it too"""
@@ -1095,13 +1137,37 @@ class DimmerApp:
         self.upd_text.set("Update downloaded. Restart Dimmer to finish the update.")
         self.show()      # bring the window up so the Restart button is seen
 
+    def nearest_monitor(self, hw):
+        rc = wintypes.RECT()
+        if not user32.GetWindowRect(hw, ctypes.byref(rc)):
+            return None
+        cx, cy = (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2
+        best, best_d = None, None
+        for i, mon in enumerate(self.monitors):
+            l, t, r, b = mon["mon"]
+            d = max(l - cx, 0, cx - r) + max(t - cy, 0, cy - b)
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        return best
+
+    def guard_taskbars(self):
+        """keeps the taskbar on the right side of the dim layer:
+        unticked + auto-hide -> taskbar above it (bright); ticked -> taskbar under it (dim)"""
+        if not self.master_on.get() or fullscreen_busy():
+            return
+        if not self.dim_taskbar.get():
+            autohide, _ = taskbar_info()
+            if autohide:
+                lift_taskbars()
+            return
+        for hw in find_taskbars():
+            i = self.nearest_monitor(hw)
+            if i is not None and i < len(self.overlays) and self.overlays[i].shown():
+                put_taskbar_under(hw, self.overlays[i].hwnd)
+
     def taskbar_guard(self):
-        """auto-hide taskbar + 'Dim taskbar too' unticked: keep the taskbar above the dim layer"""
         try:
-            if self.master_on.get() and not self.dim_taskbar.get() and not fullscreen_busy():
-                autohide, _ = taskbar_info()
-                if autohide:
-                    lift_taskbars()
+            self.guard_taskbars()
         except Exception:
             pass
         finally:
@@ -1179,7 +1245,7 @@ class DimmerApp:
     def exit_app(self):
         self.save()
         self.stop_tray()
-        for o in self.overlays:
+        for o in self.overlays + self.strips:
             o.destroy()
         self.root.destroy()
 
