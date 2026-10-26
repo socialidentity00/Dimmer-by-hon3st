@@ -41,7 +41,7 @@ DEFAULT_LEVEL = 35          # dimming % every time Dimmer starts
 DEFAULTS_VERSION = 4        # bump to re-apply the defaults above one time
 
 # ---- updates (see the GitHub steps) -------------------------------------
-VERSION = "1.0.3"                       # raise this number before building each new release
+VERSION = "1.0.4"                       # raise this number before building each new release
 GITHUB_REPO = "socialidentity00/Dimmer-by-hon3st"   # your GitHub  username/repository
 UPDATE_ASSET = "Dimmer.exe"             # the file you attach to each GitHub release
 
@@ -659,8 +659,8 @@ class DimmerApp:
 
         self.master_on = tk.BooleanVar(value=self.cfg.get("master_on", True))
         self.master_level = tk.IntVar(value=DEFAULT_LEVEL)   # always starts at the default, never remembered
-        self.dim_taskbar = tk.BooleanVar(value=self.cfg.get("dim_taskbar", True))
-        self.keep_bright = tk.BooleanVar(value=self.cfg.get("keep_bright", True))
+        self.dim_taskbar = tk.BooleanVar(value=True)    # always ticked on start, never remembered
+        self.keep_bright = tk.BooleanVar(value=True)    # always ticked on start, never remembered
         self.startup = tk.BooleanVar(value=self.cfg.get("startup", False))
 
         self.mon_key = None
@@ -697,8 +697,6 @@ class DimmerApp:
     def save(self):
         self.cfg.update({
             "master_on": self.master_on.get(),
-            "dim_taskbar": self.dim_taskbar.get(),
-            "keep_bright": self.keep_bright.get(),
             "defaults_version": DEFAULTS_VERSION,
             "startup": self.startup.get(),
             "screens": {str(i): {"on": self.scr_on[i].get()}
