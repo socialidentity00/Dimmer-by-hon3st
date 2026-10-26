@@ -41,7 +41,7 @@ DEFAULT_LEVEL = 35          # dimming % every time Dimmer starts
 DEFAULTS_VERSION = 4        # bump to re-apply the defaults above one time
 
 # ---- updates (see the GitHub steps) -------------------------------------
-VERSION = "1.0.2"                       # raise this number before building each new release
+VERSION = "1.0.3"                       # raise this number before building each new release
 GITHUB_REPO = "socialidentity00/Dimmer-by-hon3st"   # your GitHub  username/repository
 UPDATE_ASSET = "Dimmer.exe"             # the file you attach to each GitHub release
 
@@ -518,6 +518,8 @@ class Overlay:
 BG = "#1e1e1e"
 FG = "#e6e6e6"
 ACC = "#d9a066"
+GREEN = "#2e8b45"          # "Update now" / "Restart now" button
+GREEN_HOVER = "#37a653"
 
 
 # ------------------------------------------------------------ slider looks
@@ -873,7 +875,8 @@ class DimmerApp:
         self.upd_btn.config(state="normal")
         if rel:
             self.pending_release = rel
-            self.upd_btn.config(text="Update now")
+            self.upd_btn.config(text="Update now", bg=GREEN, activebackground=GREEN_HOVER,
+                                fg="#ffffff", activeforeground="#ffffff")
             self.upd_text.set(f"{tag} is available (you have v{VERSION})")
         elif not silent:
             self.upd_text.set(f"You're up to date (v{VERSION})")
@@ -923,7 +926,8 @@ class DimmerApp:
 
     def on_update_ready(self, new_file):
         self.ready_file = new_file
-        self.upd_btn.config(text="Restart now", state="normal")
+        self.upd_btn.config(text="Restart now", state="normal", bg=GREEN, activebackground=GREEN_HOVER,
+                            fg="#ffffff", activeforeground="#ffffff")
         self.upd_text.set("Update downloaded. Restart Dimmer to finish the update.")
         self.show()      # bring the window up so the Restart button is seen
 
