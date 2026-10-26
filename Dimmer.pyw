@@ -37,11 +37,11 @@ APP = "Dimmer"
 PORT = 48653
 MAX_ALPHA = 1.0     # 100% = fully black
 EDGE_STRIP = 2
-DEFAULT_LEVEL = 35          # dimming % when the app opens for the first time
+DEFAULT_LEVEL = 35          # dimming % every time Dimmer starts
 DEFAULTS_VERSION = 4        # bump to re-apply the defaults above one time
 
 # ---- updates (see the GitHub steps) -------------------------------------
-VERSION = "1.0.1"                       # raise this number before building each new release
+VERSION = "1.0.2"                       # raise this number before building each new release
 GITHUB_REPO = "socialidentity00/Dimmer-by-hon3st"   # your GitHub  username/repository
 UPDATE_ASSET = "Dimmer.exe"             # the file you attach to each GitHub release
 
@@ -656,7 +656,7 @@ class DimmerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
 
         self.master_on = tk.BooleanVar(value=self.cfg.get("master_on", True))
-        self.master_level = tk.IntVar(value=self.cfg.get("master_level", DEFAULT_LEVEL))
+        self.master_level = tk.IntVar(value=DEFAULT_LEVEL)   # always starts at the default, never remembered
         self.dim_taskbar = tk.BooleanVar(value=self.cfg.get("dim_taskbar", True))
         self.keep_bright = tk.BooleanVar(value=self.cfg.get("keep_bright", True))
         self.startup = tk.BooleanVar(value=self.cfg.get("startup", False))
@@ -695,12 +695,11 @@ class DimmerApp:
     def save(self):
         self.cfg.update({
             "master_on": self.master_on.get(),
-            "master_level": self.master_level.get(),
             "dim_taskbar": self.dim_taskbar.get(),
             "keep_bright": self.keep_bright.get(),
             "defaults_version": DEFAULTS_VERSION,
             "startup": self.startup.get(),
-            "screens": {str(i): {"on": self.scr_on[i].get(), "level": self.scr_level[i].get()}
+            "screens": {str(i): {"on": self.scr_on[i].get()}
                         for i in range(len(self.scr_on))},
         })
         try:
@@ -758,11 +757,12 @@ class DimmerApp:
         for w in self.screen_frame.winfo_children():
             w.destroy()
         saved = self.cfg.get("screens", {})
+        old_levels = [v.get() for v in self.scr_level]   # keep this session's levels if screens change
         self.scr_on, self.scr_level = [], []
         for i, mon in enumerate(self.monitors):
             s = saved.get(str(i), {})
             on = tk.BooleanVar(value=s.get("on", True))
-            lvl = tk.IntVar(value=s.get("level", self.master_level.get()))
+            lvl = tk.IntVar(value=old_levels[i] if i < len(old_levels) else DEFAULT_LEVEL)
             self.scr_on.append(on)
             self.scr_level.append(lvl)
             l, t, r, b = mon["mon"]
