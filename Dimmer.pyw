@@ -24,7 +24,9 @@ import hashlib
 import subprocess
 import tempfile
 import webbrowser
+import urllib.error
 import urllib.request
+import http.client
 import math
 import tkinter as tk
 from tkinter import messagebox
@@ -41,7 +43,7 @@ DEFAULT_LEVEL = 35          # dimming % every time Dimmer starts
 DEFAULTS_VERSION = 4        # bump to re-apply the defaults above one time
 
 # ---- updates (see the GitHub steps) -------------------------------------
-VERSION = "1.0.4"                       # raise this number before building each new release
+VERSION = "1.0.5"                       # raise this number before building each new release
 GITHUB_REPO = "socialidentity00/Dimmer-by-hon3st"   # your GitHub  username/repository
 UPDATE_ASSET = "Dimmer.exe"             # the file you attach to each GitHub release
 
@@ -115,6 +117,43 @@ def taskbar_info():
     if shell32.SHAppBarMessage(0x5, ctypes.byref(abd)):          # ABM_GETTASKBARPOS
         edge = abd.uEdge
     return autohide, edge
+
+
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
+user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowExW.restype = wintypes.HWND
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetWindowPos.restype = wintypes.BOOL
+HWND_TOPMOST = wintypes.HWND(-1)
+
+
+def lift_taskbars():
+    """put the Windows taskbar(s) above the dim layer, so an auto-hide taskbar that
+    slides in is already bright (otherwise it stays dim until you click it)"""
+    hwnds = []
+    main = user32.FindWindowW("Shell_TrayWnd", None)
+    if main:
+        hwnds.append(main)
+    h = None
+    for _ in range(8):
+        h = user32.FindWindowExW(None, h, "Shell_SecondaryTrayWnd", None)
+        if not h:
+            break
+        hwnds.append(h)
+    for hw in hwnds:
+        user32.SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+
+
+def fullscreen_busy():
+    """True while a fullscreen app/game/presentation is running (leave the taskbar alone then)"""
+    try:
+        state = ctypes.c_int(0)
+        shell32.SHQueryUserNotificationState(ctypes.byref(state))
+        return state.value in (2, 3, 4)
+    except Exception:
+        return False
 
 
 def overlay_rect(mon, dim_taskbar, autohide, edge):
@@ -345,6 +384,37 @@ def version_tuple(text):
         digits = "".join(ch for ch in part if ch.isdigit())
         nums.append(int(digits) if digits else 0)
     return tuple(nums)
+
+
+class UpdateError(Exception):
+    """kind: 'network' (internet problem) | 'disk' (can't save the file) | 'github' (anything else)"""
+
+    def __init__(self, kind, text):
+        super().__init__(text)
+        self.kind = kind
+        self.text = text
+
+
+def classify_error(e):
+    if isinstance(e, UpdateError):
+        return e
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 404:
+            return UpdateError("github", "GitHub couldn't find a published release for Dimmer.")
+        if e.code in (403, 429):
+            return UpdateError("github", "GitHub is limiting requests right now. Try again in a little while.")
+        return UpdateError("github", f"GitHub answered with an error (code {e.code}).")
+    if isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError,
+                      http.client.HTTPException)):
+        return UpdateError("network", "Weak or no internet connection.")
+    if isinstance(e, PermissionError):
+        return UpdateError("disk", "Dimmer can't save the update next to Dimmer.exe. "
+                                   "Move Dimmer.exe to Documents or Desktop and try again.")
+    if isinstance(e, OSError):
+        return UpdateError("disk", "Dimmer couldn't save the update file on this PC.")
+    if isinstance(e, (ValueError, KeyError, TypeError)):
+        return UpdateError("github", "GitHub sent back something Dimmer couldn't read.")
+    return UpdateError("github", "Something unexpected went wrong while updating.")
 
 
 def _http_get(url, timeout=15, api=False):
@@ -637,6 +707,15 @@ class Slider(tk.Canvas):
         self.command(v)
 
 
+def flat_button(parent, text, command, bg="#333333", hover="#444444", fg=None, padx=14):
+    b = tk.Button(parent, text=text, command=command, bg=bg, fg=fg or FG, relief="flat", bd=0,
+                  activebackground=hover, activeforeground=fg or FG, padx=padx, pady=6,
+                  cursor="hand2", font=("Segoe UI", 10))
+    b.bind("<Enter>", lambda e: b.config(bg=hover))
+    b.bind("<Leave>", lambda e: b.config(bg=bg))
+    return b
+
+
 class DimmerApp:
     def __init__(self):
         self.q = queue.Queue()
@@ -671,6 +750,9 @@ class DimmerApp:
         self.tray = None
         self.hidden = False
         self.pending_release = None
+        self.busy = False            # True while an update is downloading
+        self.auto_tries = 0
+        self.popup = None
         self.ready_file = None      # downloaded update waiting for a restart
         self.master_flag = self.master_on.get()   # thread-safe mirror for the tray
 
@@ -682,7 +764,8 @@ class DimmerApp:
         self.start_tray()
         self.poll()
         self.tick()
-        self.root.after(4000, lambda: self.check_updates(silent=True))
+        self.root.after(1500, lambda: self.check_updates(silent=True))   # auto-check on every start
+        self.root.after(500, self.taskbar_guard)
         self.clean_old_update()
         self.root.after(8000, self.fix_shortcuts_once)
 
@@ -842,6 +925,14 @@ class DimmerApp:
             self.root.after(1000, self.tick)
 
     # --------------------------------------------------------------- updates
+    def set_update_btn(self, text, mode):
+        """mode: normal (grey) | green | busy (greyed out, can't be clicked)"""
+        bg, fg, hover = {"normal": ("#333333", FG, "#444444"),
+                         "green": (GREEN, "#ffffff", GREEN_HOVER),
+                         "busy": ("#2b2b2b", "#8a8a8a", "#2b2b2b")}[mode]
+        self.upd_btn.config(text=text, bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+                            disabledforeground=fg, state="disabled" if mode == "busy" else "normal")
+
     def on_update_click(self):
         if self.ready_file:
             self.install_update(self.ready_file)      # "Restart now"
@@ -851,13 +942,15 @@ class DimmerApp:
             self.check_updates()
 
     def check_updates(self, silent=False):
+        if self.busy or self.ready_file or (silent and self.pending_release):
+            return
         if GITHUB_REPO.startswith("YOUR-"):
             if not silent:
                 self.upd_text.set("Put your GitHub name in GITHUB_REPO first")
             return
         if not silent:
-            self.upd_btn.config(state="disabled")
-            self.upd_text.set("Checking...")
+            self.set_update_btn("Checking...", "busy")
+            self.upd_text.set("Checking for updates...")
         threading.Thread(target=self._check_worker, args=(silent,), daemon=True).start()
 
     def _check_worker(self, silent):
@@ -867,29 +960,99 @@ class DimmerApp:
             newer = version_tuple(tag) > version_tuple(VERSION)
             self.q.put(("update_info", rel if newer else None, tag, silent))
         except Exception as e:
-            self.q.put(("update_error", str(e), silent))
+            err = classify_error(e)
+            self.q.put(("update_error", err.kind, err.text, silent))
 
     def on_update_info(self, rel, tag, silent):
-        self.upd_btn.config(state="normal")
+        if self.busy or self.ready_file:
+            return
         if rel:
             self.pending_release = rel
-            self.upd_btn.config(text="Update now", bg=GREEN, activebackground=GREEN_HOVER,
-                                fg="#ffffff", activeforeground="#ffffff")
+            self.set_update_btn("Update now", "green")
             self.upd_text.set(f"{tag} is available (you have v{VERSION})")
-        elif not silent:
-            self.upd_text.set(f"You're up to date (v{VERSION})")
+        else:
+            self.pending_release = None
+            self.set_update_btn("Check for updates", "normal")
+            if not silent:
+                self.upd_text.set(f"You're up to date (v{VERSION})")
 
-    def on_update_error(self, msg, silent):
-        self.upd_btn.config(state="normal")
-        if silent:
+    def on_update_error(self, kind, text, silent):
+        if silent:                        # the quiet check at startup: say nothing, maybe retry
+            if kind == "network" and self.auto_tries < 3:
+                self.auto_tries += 1
+                self.root.after(30000, lambda: self.check_updates(silent=True))
             return
-        if "404" in msg:
-            msg = "No release found on GitHub yet"
-        self.upd_text.set("Update problem: " + msg[:70])
+        self.busy = False
+        if self.pending_release:
+            self.set_update_btn("Update now", "green")
+        else:
+            self.set_update_btn("Check for updates", "normal")
+        if kind == "network":
+            self.upd_text.set("Weak or no internet. Check your connection and try again.")
+        elif kind == "disk":
+            self.upd_text.set(text)
+        else:
+            self.upd_text.set("Couldn't update automatically.")
+            self.show_manual_popup(text)
+
+    def show_manual_popup(self, reason):
+        """nice window with the GitHub link, a copy button and an open-in-browser button"""
+        url = f"https://github.com/{GITHUB_REPO}/releases/latest"
+        self.show()
+        if self.popup is not None:
+            try:
+                self.popup.destroy()
+            except Exception:
+                pass
+        win = self.popup = tk.Toplevel(self.root)
+        win.title("Dimmer - update problem")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.iconphoto(False, *self.icon_imgs)
+        except Exception:
+            pass
+        pad = {"padx": 24}
+        tk.Label(win, text="Couldn't update automatically", bg=BG, fg=ACC,
+                 font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(22, 6), **pad)
+        tk.Label(win, text=reason, bg=BG, fg=FG, font=("Segoe UI", 10), wraplength=420,
+                 justify="left").pack(anchor="w", **pad)
+        tk.Label(win, text="You can download the newest Dimmer.exe yourself from GitHub:", bg=BG,
+                 fg="#aaaaaa", font=("Segoe UI", 10), wraplength=420,
+                 justify="left").pack(anchor="w", pady=(16, 6), **pad)
+        box = tk.Frame(win, bg="#2a2a2a", highlightthickness=1, highlightbackground="#444444")
+        box.pack(fill="x", **pad)
+        entry = tk.Entry(box, relief="flat", bd=0, bg="#2a2a2a", fg=FG, readonlybackground="#2a2a2a",
+                         insertbackground=FG, highlightthickness=0, font=("Consolas", 10))
+        entry.insert(0, url)
+        entry.config(state="readonly")
+        entry.pack(fill="x", padx=10, pady=9)
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", pady=(16, 6), **pad)
+
+        def copy():
+            win.clipboard_clear()
+            win.clipboard_append(url)
+            copy_btn.config(text="Copied!")
+            win.after(1600, lambda: copy_btn.winfo_exists() and copy_btn.config(text="Copy link"))
+
+        copy_btn = flat_button(row, "Copy link", copy)
+        copy_btn.pack(side="left")
+        flat_button(row, "Open in browser", lambda: webbrowser.open(url), bg=GREEN, hover=GREEN_HOVER,
+                    fg="#ffffff").pack(side="left", padx=(8, 0))
+        flat_button(row, "Close", win.destroy).pack(side="right")
+        tk.Label(win, text="After downloading, close Dimmer and replace your old Dimmer.exe with the new one.",
+                 bg=BG, fg="#888888", font=("Segoe UI", 9), wraplength=420,
+                 justify="left").pack(anchor="w", pady=(8, 22), **pad)
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_y() + 40
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.focus_force()
 
     def start_update(self):
         rel = self.pending_release
-        tag = rel.get("tag_name", "")
         if not getattr(sys, "frozen", False):
             # running as a .pyw script: just open the download page
             webbrowser.open(rel.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases")
@@ -897,9 +1060,10 @@ class DimmerApp:
             return
         asset = find_asset(rel, UPDATE_ASSET)
         if asset is None:
-            self.upd_text.set(f"That release has no {UPDATE_ASSET} file")
+            self.on_update_error("github", f"The newest release doesn't contain {UPDATE_ASSET}.", False)
             return
-        self.upd_btn.config(state="disabled")
+        self.busy = True
+        self.set_update_btn("Downloading...", "busy")      # changes at once, no flicker
         self.upd_text.set("Downloading... 0%")
         threading.Thread(target=self._download_worker, args=(rel, asset), daemon=True).start()
 
@@ -911,23 +1075,37 @@ class DimmerApp:
             with open(new, "rb") as f:
                 is_exe = f.read(2) == b"MZ"
             if want and got != want:
-                raise RuntimeError("Checksum did not match, update cancelled")
+                raise UpdateError("github", "The downloaded file didn't match its checksum, so the "
+                                            "update was cancelled to keep you safe.")
             if not is_exe:
-                raise RuntimeError("Downloaded file is not a program, update cancelled")
+                raise UpdateError("github", "The downloaded file doesn't look like the Dimmer program.")
             self.q.put(("update_ready", new))
         except Exception as e:
             try:
                 os.remove(new)
             except OSError:
                 pass
-            self.q.put(("update_error", str(e), False))
+            err = classify_error(e)
+            self.q.put(("update_error", err.kind, err.text, False))
 
     def on_update_ready(self, new_file):
+        self.busy = False
         self.ready_file = new_file
-        self.upd_btn.config(text="Restart now", state="normal", bg=GREEN, activebackground=GREEN_HOVER,
-                            fg="#ffffff", activeforeground="#ffffff")
+        self.set_update_btn("Restart now", "green")
         self.upd_text.set("Update downloaded. Restart Dimmer to finish the update.")
         self.show()      # bring the window up so the Restart button is seen
+
+    def taskbar_guard(self):
+        """auto-hide taskbar + 'Dim taskbar too' unticked: keep the taskbar above the dim layer"""
+        try:
+            if self.master_on.get() and not self.dim_taskbar.get() and not fullscreen_busy():
+                autohide, _ = taskbar_info()
+                if autohide:
+                    lift_taskbars()
+        except Exception:
+            pass
+        finally:
+            self.root.after(250, self.taskbar_guard)
 
     def clean_old_update(self):
         if getattr(sys, "frozen", False):
@@ -1027,7 +1205,8 @@ class DimmerApp:
                     if kind == "update_info":
                         self.on_update_info(*cmd[1:])
                     elif kind == "update_progress":
-                        self.upd_text.set(f"Downloading... {cmd[1]}%")
+                        if self.busy:
+                            self.upd_text.set(f"Downloading... {cmd[1]}%")
                     elif kind == "update_error":
                         self.on_update_error(*cmd[1:])
                     elif kind == "update_ready":
